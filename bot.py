@@ -22,17 +22,17 @@ LOCATION, PICKUP_DATE, DROP_DATE, CAR_TYPE = range(4)
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 PORT = int(os.getenv("PORT", 10000))
 
-LOC_MAP = {
-    "Ηράκλειο (HER)": "Crete - Heraklion Airport",
-    "Χανιά (CHQ)": "Crete - Chania Airport",
-    "Σαντορίνη (JTR)": "Santorini Airport",
-    "Αθήνα (ATH)": "Athens Airport"
+LOC_CODES = {
+    "Ηράκλειο (HER)": "heraklion_airport",
+    "Χανιά (CHQ)": "chania_airport",
+    "Σαντορίνη (JTR)": "santorini_airport",
+    "Αθήνα (ATH)": "athens_airport"
 }
 
-# Dummy Web Server για να περνάει το Health Check του Render Free Tier
+# Web Server για το Render Free Tier
 async def start_dummy_server():
     async def handle_ping(request):
-        return web.Response(text="Bot is running!")
+        return web.Response(text="Carsniper is running!")
 
     server = web.Application()
     server.router.add_get("/", handle_ping)
@@ -45,24 +45,23 @@ async def start_dummy_server():
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_keyboard = [["Ηράκλειο (HER)", "Χανιά (CHQ)"], ["Σαντορίνη (JTR)", "Αθήνα (ATH)"]]
     await update.message.reply_text(
-        "🚗 **Carsniper Bot**\nΕπιλέξτε τοποθεσία ή πληκτρολογήστε σημείο:",
+        "🚗 **Carsniper Bot**\nΕπιλέξτε τοποθεσία αναζήτησης:",
         reply_markup=ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True, resize_keyboard=True),
         parse_mode="Markdown"
     )
     return LOCATION
 
 async def location_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    loc_input = update.message.text
-    context.user_data["location"] = LOC_MAP.get(loc_input, loc_input)
+    context.user_data["location"] = update.message.text
     await update.message.reply_text(
-        "📅 Δώστε ημερομηνία **Παραλαβής** (π.χ. `27/08/2026`):",
+        "📅 Δώστε ημερομηνία **Παραλαβής** (π.χ. `28/08/2026`):",
         reply_markup=ReplyKeyboardRemove(),
         parse_mode="Markdown"
     )
     return PICKUP_DATE
 
 async def pickup_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["pickup"] = update.message.text
+    context.user_data["pickup"] = update.message.text.strip()
     await update.message.reply_text(
         "📅 Δώστε ημερομηνία **Παράδοσης** (π.χ. `29/08/2026`):",
         parse_mode="Markdown"
@@ -70,7 +69,7 @@ async def pickup_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return DROP_DATE
 
 async def drop_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["drop"] = update.message.text
+    context.user_data["drop"] = update.message.text.strip()
     categories = [["Small / Mini", "Economy"], ["Compact", "SUV"], ["Όλες οι κατηγορίες"]]
     await update.message.reply_text(
         "🚙 Επιλέξτε κατηγορία οχήματος:",
@@ -80,70 +79,71 @@ async def drop_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def scrape_doyouspain(params):
     results = []
+    
+    p_date = params.get("pickup", "28/08/2026").replace("-", "/")
+    d_date = params.get("drop", "29/08/2026").replace("-", "/")
+    loc_key = params.get("location", "Ηράκλειο (HER)")
+    loc_slug = LOC_CODES.get(loc_key, "heraklion_airport")
+
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
-            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled"
+            ]
         )
         context = await browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-            viewport={"width": 1366, "height": 768}
+            viewport={"width": 1440, "height": 900},
+            locale="en-GB"
         )
         page = await context.new_page()
 
         try:
-            await page.goto("https://www.doyouspain.com/", wait_until="domcontentloaded", timeout=45000)
-            await page.wait_for_timeout(2000)
+            target_url = f"https://www.doyouspain.com/do/list/en?loc={loc_slug}&pickup={p_date}&dropoff={d_date}"
+            await page.goto(target_url, wait_until="domcontentloaded", timeout=40000)
+            await page.wait_for_timeout(6000)
 
-            loc_input = page.locator("#place_origen_des, input[name='lugar_entrega']").first
-            if await loc_input.count() > 0:
-                await loc_input.fill(params.get("location", "Crete - Heraklion Airport"))
-                await page.wait_for_timeout(1000)
-                await page.keyboard.press("ArrowDown")
-                await page.keyboard.press("Enter")
-
-            search_btn = page.locator("#btnBuscar, button[type='submit']").first
-            if await search_btn.count() > 0:
-                await search_btn.click()
-
-            await page.wait_for_selector("a:has-text('View deal'), div[class*='deal']", timeout=35000)
-            await page.wait_for_timeout(3000)
-
-            deals = await page.locator("xpath=//a[contains(., 'View deal')]/ancestor::div[contains(@class, 'deal') or contains(@class, 'card') or position()=1]").all()
-            if not deals:
-                deals = await page.locator("div[class*='deal'], div[class*='result']").all()
+            # Εύρεση καρτών αποτελεσμάτων
+            cards = await page.locator("xpath=//div[contains(., '€') and (contains(., 'View deal') or contains(., 'Price for') or contains(., 'or similar'))]").all()
+            
+            if not cards:
+                cards = await page.locator("div[class*='deal'], div[class*='car'], div[class*='result']").all()
 
             rank = 1
-            seen_vehicles = set()
+            seen = set()
 
-            for deal in deals:
+            for card in cards:
                 if rank > 10:
                     break
-                text = await deal.inner_text()
+                text = await card.inner_text()
                 
                 prices = re.findall(r'(\d+[\.,]\d{2})\s*€', text)
-                if not price_matches:
+                if not prices:
                     continue
 
                 price_main = float(prices[0].replace(",", "."))
                 price_day = float(prices[1].replace(",", ".")) if len(prices) > 1 else price_main
 
-                car_name = "Car Model"
+                car_name = "Mini / Economy Car"
                 lines = [line.strip() for line in text.split("\n") if line.strip()]
                 for l in lines:
-                    if "or similar" in l.lower() or any(b in l.lower() for b in ["fiat", "citroen", "vw", "toyota", "hyundai", "peugeot", "opel", "renault", "skoda"]):
+                    if "or similar" in l.lower() or any(b in l.lower() for b in ["fiat", "citroen", "vw", "toyota", "hyundai", "peugeot", "opel", "renault", "skoda", "nissan", "kia"]):
                         car_name = l
                         break
 
-                deal_key = f"{car_name}_{price_main}"
-                if deal_key in seen_vehicles:
+                key = f"{car_name}_{price_main}"
+                if key in seen:
                     continue
-                seen_vehicles.add(deal_key)
+                seen.add(key)
 
-                supplier = "Partner"
-                for s_name in ["Surprice", "Abbycar", "addCar", "AutoUnion", "Autocar", "Avance", "Avis", "Beepit", "Caldera", "CarRental2Greece", "Carwiz", "Centauro", "Cretamotor", "Enterprise", "Europcar", "Exer", "Flex", "Goldcar", "Green Motion", "Hertz", "Sixt"]:
-                    if s_name.lower() in text.lower():
-                        supplier = s_name
+                supplier = "DoYouSpain Partner"
+                for s in ["Surprice", "Abbycar", "addCar", "AutoUnion", "Autocar", "Avance", "Avis", "Beepit", "Caldera", "CarRental2Greece", "Carwiz", "Centauro", "Cretamotor", "Enterprise", "Europcar", "Exer", "Flex", "Goldcar", "Green Motion", "Grentals", "Hertz", "Sixt", "OK Mobility"]:
+                    if s.lower() in text.lower():
+                        supplier = s
                         break
 
                 results.append({
@@ -156,7 +156,7 @@ async def scrape_doyouspain(params):
                 rank += 1
 
         except Exception as e:
-            print(f"Scraping exception: {e}")
+            print(f"Extraction error: {e}")
         finally:
             await browser.close()
 
@@ -169,7 +169,7 @@ async def car_type_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = await scrape_doyouspain(context.user_data)
 
     if not data:
-        await update.message.reply_text("❌ Δεν βρέθηκαν αποτελέσματα. Δοκιμάστε ξανά.")
+        await update.message.reply_text("❌ Δεν ήταν δυνατή η ανάκτηση των τιμών. Δοκιμάστε ξανά.")
         return ConversationHandler.END
 
     msg_lines = ["🏆 **Top 10 Αποτελέσματα (DoYouSpain Live):**\n"]
@@ -181,7 +181,7 @@ async def car_type_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     await update.message.reply_text("\n".join(msg_lines), parse_mode="Markdown")
 
-    # Δημιουργία και στυλιζάρισμα Excel
+    # Δημιουργία ODS / Excel αρχείου
     df = pd.DataFrame(data)
     df.columns = ["Κατάταξη", "Όχημα / Μοντέλο", "Εταιρεία", "Συνολική Τιμή (€)", "Τιμή ανά Ημέρα (€)"]
     
@@ -254,7 +254,6 @@ async def main_async():
     await app.start()
     await app.updater.start_polling()
     
-    # Διατήρηση της εφαρμογής ανοιχτής
     while True:
         await asyncio.sleep(3600)
 
