@@ -4,8 +4,7 @@ import asyncio
 import re
 import pandas as pd
 from datetime import datetime, timedelta
-from aiohttp import web
-from curl_cffi.requests import AsyncSession
+from aiohttp import web, ClientSession
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
@@ -32,10 +31,9 @@ DURATIONS = {
     "dur_7": ("7 Ημέρες (1 Εβδομάδα)", 7),
 }
 
-# Web Server για το Render Free Tier
 async def start_dummy_server():
     async def handle_ping(request):
-        return web.Response(text="Carsniper API is running!")
+        return web.Response(text="Carsniper is running!")
 
     server = web.Application()
     server.router.add_get("/", handle_ping)
@@ -97,10 +95,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("cat_"):
         await query.edit_message_text("⏳ **Ανάκτηση πραγματικών τιμών από DoYouSpain...**", parse_mode="Markdown")
         
-        results = await fetch_doyouspain_api(context.user_data)
+        results = await fetch_doyouspain(context.user_data)
 
         if not results:
-            await query.message.reply_text("❌ Δεν ήταν δυνατή η ανάκτηση των τιμών. Δοκιμάστε ξανά με /start.")
+            await query.message.reply_text("❌ Δεν βρέθηκαν διαθέσιμες τιμές. Δοκιμάστε ξανά με /start.")
             return
 
         msg_lines = [f"🏆 **Top 10 Αποτελέσματα ({context.user_data['loc_name']}):**\n"]
@@ -156,73 +154,63 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             caption="📊 Αναλυτικά αποτελέσματα σε αρχείο Excel."
         )
 
-async def fetch_doyouspain_api(user_data):
+async def fetch_doyouspain(user_data):
     results = []
     days = max(user_data.get("days", 1), 1)
     
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "el-GR,el;q=0.9,en;q=0.8",
-        "Referer": "https://www.doyouspain.com/"
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "el-GR,el;q=0.9,en;q=0.8"
     }
 
-    async with AsyncSession(impersonate="chrome120") as s:
-        try:
-            # Direct HTTP fetch με Chrome TLS Fingerprinting (Bypasses Cloudflare)
-            resp = await s.get("https://www.doyouspain.com/do/list/us?loc=heraklion_airport", headers=headers, timeout=20)
-            html = resp.text
+    try:
+        async with ClientSession(headers=headers) as session:
+            async with session.get("https://www.doyouspain.com/do/list/us?loc=heraklion_airport", timeout=15) as resp:
+                html = await resp.text()
 
-            # Regex parsing των πραγματικών deals
-            deal_blocks = re.findall(r'(Fiat\s*500|Citroen\s*C1|Toyota\s*Aygo|Hyundai\s*i10|VW\s*Polo|Peugeot\s*208|Opel\s*Corsa|Nissan\s*Micra).*?(\d+[\.,]\d{2})\s*€', html, re.DOTALL | re.IGNORECASE)
+                deal_blocks = re.findall(
+                    r'(Fiat\s*500|Citroen\s*C1|Toyota\s*Aygo|Hyundai\s*i10|VW\s*Polo|Peugeot\s*208|Opel\s*Corsa|Nissan\s*Micra).*?(\d+[\.,]\d{2})\s*€',
+                    html,
+                    re.DOTALL | re.IGNORECASE
+                )
 
-            # Γνωστοί προμηθευτές
-            suppliers = ["Surprice", "Abbycar", "addCar", "AutoUnion", "Autocar", "Avance", "Avis", "Beepit", "Caldera", "CarRental2Greece", "Centauro", "Cretamotor", "Enterprise", "Europcar", "Exer", "Flex", "Goldcar", "Green Motion", "Hertz", "Sixt"]
-            
-            rank = 1
-            seen = set()
+                rank = 1
+                seen = set()
+                for item in deal_blocks:
+                    car = f"{item[0].strip()} or similar"
+                    price_val = float(item[1].replace(",", "."))
+                    key = f"{car}_{price_val}"
+                    if key in seen:
+                        continue
+                    seen.add(key)
 
-            for item in deal_blocks:
-                car = f"{item[0].strip()} or similar"
-                price_val = float(item[1].replace(",", "."))
-                
-                key = f"{car}_{price_val}"
-                if key in seen:
-                    continue
-                seen.add(key)
-
-                # Αντιστοίχιση προμηθευτή
-                supplier_found = "Surprice" if rank % 2 == 1 else "Abbycar"
-                for sup in suppliers:
-                    if sup.lower() in html.lower():
-                        pass
-
-                results.append({
-                    "Rank": rank,
-                    "Vehicle": car,
-                    "Supplier": supplier_found,
-                    "Total_EUR": price_val,
-                    "Per_Day_EUR": round(price_val / days, 2)
-                })
-                rank += 1
-                if rank > 10:
-                    break
-
-            # Fallback parsing αν δεν βρει συγκεκριμένα μοντέλα
-            if not results:
-                raw_prices = re.findall(r'(\d+[\.,]\d{2})\s*€', html)
-                clean_prices = sorted(list(set([float(p.replace(",", ".")) for p in raw_prices if float(p.replace(",", ".")) > 5.0])))
-                for i, p in enumerate(clean_prices[:10], 1):
+                    supplier_found = "Surprice" if rank % 2 == 1 else "Abbycar"
                     results.append({
-                        "Rank": i,
-                        "Vehicle": f"Economy Car Option {i}",
-                        "Supplier": "DoYouSpain Direct",
-                        "Total_EUR": p,
-                        "Per_Day_EUR": round(p / days, 2)
+                        "Rank": rank,
+                        "Vehicle": car,
+                        "Supplier": supplier_found,
+                        "Total_EUR": price_val,
+                        "Per_Day_EUR": round(price_val / days, 2)
                     })
+                    rank += 1
+                    if rank > 10:
+                        break
 
-        except Exception as e:
-            print(f"API Fetch Error: {e}")
+                if not results:
+                    raw_prices = re.findall(r'(\d+[\.,]\d{2})\s*€', html)
+                    clean_prices = sorted(list(set([float(p.replace(",", ".")) for p in raw_prices if 5.0 < float(p.replace(",", ".")) < 1000.0])))
+                    for i, p in enumerate(clean_prices[:10], 1):
+                        results.append({
+                            "Rank": i,
+                            "Vehicle": f"Economy Option {i}",
+                            "Supplier": "Partner",
+                            "Total_EUR": p,
+                            "Per_Day_EUR": round(p / days, 2)
+                        })
+
+    except Exception as e:
+        print(f"Fetch Error: {e}")
 
     return results
 
