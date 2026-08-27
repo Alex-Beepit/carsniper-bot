@@ -36,7 +36,7 @@ DURATIONS = {
 
 async def start_dummy_server():
     async def handle_ping(request):
-        return web.Response(text="Carsniper Stealth Live")
+        return web.Response(text="Carsniper Xvfb Live")
     server = web.Application()
     server.router.add_get("/", handle_ping)
     runner = web.AppRunner(server)
@@ -92,12 +92,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data == "scrape_now":
-        await query.edit_message_text("⏳ **Ανάκτηση μέσω stealth browser...** \nΠαρακαλώ περιμένετε 20-30 δευτερόλεπτα (παρακάμπτουμε το Cloudflare).", parse_mode="Markdown")
+        await query.edit_message_text("⏳ **Ανάκτηση μέσω εικονικής οθόνης (Bypassing Cloudflare)...** \nΠαρακαλώ περιμένετε 20-30 δευτερόλεπτα.", parse_mode="Markdown")
         
         results = await scrape_with_playwright(context.user_data)
 
         if not results:
-            await query.message.reply_text("❌ Το DoYouSpain μπλόκαρε προσωρινά την IP του server. Δοκιμάστε ξανά σε λίγα λεπτά με /start.")
+            await query.message.reply_text("❌ Η αναζήτηση απέτυχε. Το σύστημα ασφαλείας είναι ενεργό. Δοκιμάστε ξανά σε 5 λεπτά με /start.")
             return
 
         msg_lines = [f"🏆 **Top 10 Αποτελέσματα ({context.user_data['loc_name']}):**\n"]
@@ -160,8 +160,9 @@ async def scrape_with_playwright(user_data):
     d_str = user_data.get("d_str")
     
     async with async_playwright() as p:
+        # ΤΟ ΑΠΟΛΥΤΟ ΜΥΣΤΙΚΟ ΕΙΝΑΙ ΕΔΩ: headless=False
         browser = await p.chromium.launch(
-            headless=True,
+            headless=False,
             args=[
                 "--no-sandbox", 
                 "--disable-setuid-sandbox", 
@@ -172,30 +173,28 @@ async def scrape_with_playwright(user_data):
         context = await browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
             viewport={"width": 1920, "height": 1080},
-            locale="en-GB",
+            locale="el-GR",
             timezone_id="Europe/Athens"
         )
         page = await context.new_page()
         
-        # Ενεργοποίηση Stealth Mode
         await stealth_async(page)
         
         try:
-            # Τυχαία καθυστέρηση πριν την κλήση
-            await asyncio.sleep(random.uniform(1.5, 3.5))
+            await asyncio.sleep(random.uniform(1.0, 2.5))
             
             url = f"https://www.doyouspain.com/do/list/en?loc={loc_slug}&pickup={p_str}&dropoff={d_str}"
             await page.goto(url, wait_until="domcontentloaded", timeout=60000)
             
-            # Προσομοίωση ανθρώπινου scroll
-            await page.mouse.wheel(0, 500)
-            await asyncio.sleep(random.uniform(2.0, 4.0))
+            # Έξτρα χρόνος αν εμφανιστεί ο κύκλος φόρτωσης του Cloudflare
+            await page.wait_for_timeout(6000)
+            await page.mouse.wheel(0, 700)
+            await asyncio.sleep(random.uniform(2.0, 3.0))
             
             try:
-                await page.wait_for_selector("text=View deal", timeout=35000)
-                await page.wait_for_timeout(3000)
+                await page.wait_for_selector("text=View deal", timeout=30000)
             except Exception:
-                await page.wait_for_timeout(6000)
+                await page.wait_for_timeout(5000)
 
             cards = await page.locator("div[class*='deal'], div[class*='result'], div[class*='car']").all()
             
@@ -238,7 +237,7 @@ async def scrape_with_playwright(user_data):
                 rank += 1
 
         except Exception as e:
-            print(f"Playwright Error: {e}")
+            print(f"Playwright Xvfb Error: {e}")
         finally:
             await browser.close()
             
