@@ -1,21 +1,20 @@
-FROM python:3.11
+FROM python:3.11-slim
 
-# Κλείνουμε όλες τις ερωτήσεις του Linux κατά την εγκατάσταση
+# Η ΠΙΟ ΣΗΜΑΝΤΙΚΗ ΕΝΤΟΛΗ: Λέει στην Python να δείχνει τα σφάλματα αμέσως!
+ENV PYTHONUNBUFFERED=1
 ENV DEBIAN_FRONTEND=noninteractive
 
 WORKDIR /app
 
-# Εγκατάσταση εικονικής οθόνης (xvfb) αθόρυβα
 RUN apt-get update && apt-get install -y xvfb tzdata
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Εγκατάσταση Chromium και των εξαρτήσεών του
 RUN playwright install chromium
 RUN playwright install-deps chromium
 
 COPY . .
 
-# Εκκίνηση του bot στην εικονική οθόνη
-CMD ["xvfb-run", "-a", "python", "bot.py"]
+# Εκκίνηση χωρίς αγκύλες (shell mode) για να μην μπερδεύεται το Xvfb
+CMD xvfb-run -a python bot.py
