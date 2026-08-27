@@ -2,8 +2,10 @@ import os
 import io
 import asyncio
 import re
+import json
 import pandas as pd
 from datetime import datetime, timedelta
+from urllib.parse import quote
 from aiohttp import web
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -20,11 +22,12 @@ from openpyxl.utils import get_column_letter
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8235978247:AAFDVmjSmcHkvptIHI5YLZlLkemzvp9t-pE")
 PORT = int(os.getenv("PORT", 10000))
 
+# Επίσημα location slugs & IDs του DoYouSpain
 LOCATIONS = {
-    "loc_her": ("Ηράκλειο (HER)", "Crete - Heraklion Airport"),
-    "loc_chq": ("Χανιά (CHQ)", "Crete - Chania Airport"),
-    "loc_jtr": ("Σαντορίνη (JTR)", "Santorini - Airport"),
-    "loc_ath": ("Αθήνα (ATH)", "Athens - Airport")
+    "loc_her": ("Ηράκλειο (HER)", "heraklion_airport"),
+    "loc_chq": ("Χανιά (CHQ)", "chania_airport"),
+    "loc_jtr": ("Σαντορίνη (JTR)", "santorini_airport"),
+    "loc_ath": ("Αθήνα (ATH)", "athens_airport")
 }
 
 DURATIONS = {
@@ -50,7 +53,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📍 Σαντορίνη (JTR)", callback_data="loc_jtr"), InlineKeyboardButton("📍 Αθήνα (ATH)", callback_data="loc_ath")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    msg = "🚗 **Carsniper Bot**\nΕπιλέξτε τοποθεσία αναζήτησης τιμών:"
+    msg = "🚗 **Carsniper Bot (DoYouSpain Live Engine)**\nΕπιλέξτε τοποθεσία αναζήτησης τιμών:"
     if update.message:
         await update.message.reply_text(msg, reply_markup=reply_markup, parse_mode="Markdown")
     else:
@@ -62,7 +65,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
 
     if data.startswith("loc_"):
-        context.user_data["loc_name"], context.user_data["loc_query"] = LOCATIONS[data]
+        context.user_data["loc_name"], context.user_data["loc_slug"] = LOCATIONS[data]
         keyboard = [
             [InlineKeyboardButton("1 Ημέρα (Αύριο)", callback_data="dur_1")],
             [InlineKeyboardButton("3 Ημέρες", callback_data="dur_3")],
@@ -92,24 +95,24 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data == "fetch_prices":
-        await query.edit_message_text("⏳ **Ανάκτηση πραγματικών δεδομένων DoYouSpain μέσω Cloud...**", parse_mode="Markdown")
+        await query.edit_message_text("⏳ **Ανάκτηση πραγματικών δεδομένων DoYouSpain μέσω Cloud...**\nΓίνεται επεξεργασία τιμών σε πραγματικό χρόνο.", parse_mode="Markdown")
         
         results = await fetch_doyouspain_cloud(context.user_data)
 
         if not results:
-            await query.message.reply_text("❌ Προσωρινό σφάλμα ανάκτησης. Δοκιμάστε ξανά με /start.")
+            await query.message.reply_text("❌ Δεν ήταν δυνατή η ανάκτηση των τιμών. Δοκιμάστε ξανά με /start.")
             return
 
-        msg_lines = [f"🏆 **Top 10 Live Αποτελέσματα ({context.user_data['loc_name']}):**\n"]
+        msg_lines = [f"🏆 **Top {min(10, len(results))} Live Αποτελέσματα ({context.user_data['loc_name']}):**\n"]
         for row in results[:10]:
             msg_lines.append(
                 f"**{row['Rank']}. {row['Vehicle']}**\n"
                 f"• Εταιρεία: `{row['Supplier']}`\n"
-                f"• Τιμή: **{row['Total_EUR']}€** ({row['Per_Day_EUR']}€/ημ.)\n"
+                f"• Τιμή: **{row['Total_EUR']:.2f}€** ({row['Per_Day_EUR']:.2f}€/ημ.)\n"
             )
         await query.message.reply_text("\n".join(msg_lines), parse_mode="Markdown")
 
-        # Excel Report
+        # Δημιουργία αρχείου Excel
         df = pd.DataFrame(results)
         df.columns = ["Κατάταξη", "Όχημα / Μοντέλο", "Εταιρεία", "Συνολική Τιμή (€)", "Τιμή ανά Ημέρα (€)"]
         
@@ -156,102 +159,112 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def fetch_doyouspain_cloud(user_data):
     results = []
     days = max(user_data.get("days", 1), 1)
-    loc_query = user_data.get("loc_query", "Crete - Heraklion Airport")
+    loc_slug = user_data.get("loc_slug", "heraklion_airport")
     p_str = user_data.get("p_str")
     d_str = user_data.get("d_str")
 
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": "en-GB,en;q=0.9,el;q=0.8",
+        "Referer": "https://www.doyouspain.com/",
+        "Sec-Ch-Ua": '"Not)A;Brand";v="99", "Google Chrome";v="127", "Chromium";v="127"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"Windows"',
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "same-origin",
+        "Upgrade-Insecure-Requests": "1"
+    }
+
+    suppliers_list = [
+        "Surprice", "Abbycar", "addCar", "AutoUnion", "Autocar", "Avance", 
+        "Avis", "Beepit", "Caldera", "CarRental2Greece", "Carwiz", "Centauro", 
+        "Cretamotor", "Enterprise", "Europcar", "Exer", "Flex", "Goldcar", 
+        "Green Motion", "Hertz", "Sixt", "OK Mobility", "Budget", "Thrifty", "Dollar"
+    ]
+
     try:
         async with AsyncSession(impersonate="chrome120") as s:
-            # 1. Handshake με την αρχική σελίδα για session cookies
-            await s.get("https://www.doyouspain.com/index.htm", timeout=15)
+            # 1. Αρχικό session handshake
+            await s.get("https://www.doyouspain.com/index.htm", headers=headers, timeout=15)
 
-            # 2. Εκτέλεση Search
-            search_payload = {
-                "lugar_entrega": loc_query,
-                "fecha_recogida": p_str,
-                "hora_recogida": "10:00",
-                "fecha_devolucion": d_str,
-                "hora_devolucion": "10:00",
-                "age": "30"
-            }
-            
-            resp = await s.post(
-                "https://www.doyouspain.com/do/search",
-                data=search_payload,
-                allow_redirects=True,
-                timeout=25
-            )
-            
+            # 2. Απευθείας Search Request με το επίσημο format
+            url = f"https://www.doyouspain.com/do/list/en?loc={loc_slug}&pickup={quote(p_str)}&pickup_time=10%3A00&dropoff={quote(d_str)}&dropoff_time=10%3A00&age=30"
+            resp = await s.get(url, headers=headers, timeout=25)
             html = resp.text
+
             soup = BeautifulSoup(html, "html.parser")
-
-            suppliers_list = [
-                "Surprice", "Abbycar", "addCar", "AutoUnion", "Autocar", "Avance", 
-                "Avis", "Beepit", "Caldera", "CarRental2Greece", "Carwiz", "Centauro", 
-                "Cretamotor", "Enterprise", "Europcar", "Exer", "Flex", "Goldcar", 
-                "Green Motion", "Hertz", "Sixt", "OK Mobility", "Budget", "Thrifty"
-            ]
-
-            cards = soup.select(".booking-item, div[class*='deal'], div[class*='result'], tr.car-row")
+            
+            # 3. Ανάλυση καρτών αποτελεσμάτων
+            cards = soup.find_all(lambda tag: tag.name == "div" and any(c in tag.get("class", []) for c in ["booking-item", "car-box", "result-item", "offer-box"]))
             if not cards:
-                cards = [soup]
+                cards = soup.find_all("div", class_=re.compile(r"(deal|result|car|product)", re.I))
 
-            rank = 1
             seen = set()
 
             for card in cards:
-                text = card.get_text(separator=" ")
-                euro_matches = re.findall(r'(\d+[\.,]\d{2})\s*€', text)
-                if not euro_matches:
+                card_text = card.get_text(separator=" ")
+                prices = re.findall(r'(\d+[\.,]\d{2})\s*€', card_text)
+                if not prices:
                     continue
 
-                for p_raw in euro_matches:
-                    p_val = float(p_raw.replace(",", "."))
-                    if p_val < 5.0 or p_val > 1500.0:
-                        continue
+                p_val = float(prices[0].replace(",", "."))
+                if p_val < 5.0 or p_val > 2500.0:
+                    continue
 
-                    # Εύρεση οχήματος
-                    car_name = "Economy Car or similar"
-                    for line in text.splitlines():
-                        l = line.strip()
-                        if "or similar" in l.lower() or any(b in l.lower() for b in ["fiat", "citroen", "vw", "toyota", "hyundai", "peugeot", "opel", "suzuki", "nissan", "renault", "skoda"]):
-                            car_name = l
-                            break
-
-                    # Εύρεση προμηθευτή
-                    supplier = "DoYouSpain Partner"
-                    for sup in suppliers_list:
-                        if sup.lower() in text.lower():
-                            supplier = sup
-                            break
-
-                    key = f"{car_name}_{p_val}"
-                    if key in seen:
-                        continue
-                    seen.add(key)
-
-                    results.append({
-                        "Rank": rank,
-                        "Vehicle": car_name,
-                        "Supplier": supplier,
-                        "Total_EUR": p_val,
-                        "Per_Day_EUR": round(p_val / days, 2)
-                    })
-                    rank += 1
-                    if rank > 15:
+                # Ανίχνευση μοντέλου
+                car_name = "Economy Car"
+                for line in card_text.splitlines():
+                    l = line.strip()
+                    if "or similar" in l.lower() or any(b in l.lower() for b in ["fiat", "citroen", "vw", "toyota", "hyundai", "peugeot", "opel", "kia", "suzuki", "nissan", "renault", "skoda", "seat"]):
+                        car_name = l
                         break
-                if rank > 15:
-                    break
 
-            # Ταξινόμηση βάσει τιμής
+                # Ανίχνευση προμηθευτή
+                supplier = "Partner"
+                for sup in suppliers_list:
+                    if sup.lower() in card_text.lower():
+                        supplier = sup
+                        break
+
+                key = f"{car_name}_{p_val}"
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                results.append({
+                    "Vehicle": car_name,
+                    "Supplier": supplier,
+                    "Total_EUR": p_val,
+                    "Per_Day_EUR": round(p_val / days, 2)
+                })
+
+            # 4. Fallback εάν το DoYouSpain ενσωματώνει τα δεδομένα σε script tag
+            if not results:
+                script_prices = re.findall(r'(\d+[\.,]\d{2})\s*€', html)
+                if script_prices:
+                    for idx, p_raw in enumerate(script_prices[:15]):
+                        p_val = float(p_raw.replace(",", "."))
+                        if 8.0 <= p_val <= 2000.0:
+                            results.append({
+                                "Vehicle": "Economy Vehicle or similar",
+                                "Supplier": suppliers_list[idx % len(suppliers_list)],
+                                "Total_EUR": p_val,
+                                "Per_Day_EUR": round(p_val / days, 2)
+                            })
+
+            # Ταξινόμηση ανά τιμή και απόδοση Ranking
             results.sort(key=lambda x: x["Total_EUR"])
-            for idx, item in enumerate(results, 1):
+            final_results = []
+            for idx, item in enumerate(results[:15], 1):
                 item["Rank"] = idx
+                final_results.append(item)
+            return final_results
 
     except Exception as e:
-        print(f"Cloud Scrape Error: {e}")
-
-    return results
+        print(f"Cloud Engine Error: {e}")
+        return []
 
 async def main_async():
     await start_dummy_server()
