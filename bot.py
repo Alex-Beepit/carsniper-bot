@@ -5,7 +5,6 @@ import re
 import json
 import pandas as pd
 from datetime import datetime, timedelta
-from urllib.parse import quote_plus
 from aiohttp import web
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -21,12 +20,12 @@ from openpyxl.utils import get_column_letter
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8235978247:AAFDVmjSmcHkvptIHI5YLZlLkemzvp9t-pE")
 PORT = int(os.getenv("PORT", 10000))
 
-# DoYouSpain location mappings
+# DoYouSpain location mapping
 LOCATIONS = {
-    "loc_her": ("Ηράκλειο (HER)", "HER", "Crete - Heraklion Airport"),
-    "loc_chq": ("Χανιά (CHQ)", "CHQ", "Crete - Chania Airport"),
-    "loc_jtr": ("Σαντορίνη (JTR)", "JTR", "Santorini - Airport"),
-    "loc_ath": ("Αθήνα (ATH)", "ATH", "Athens - Airport")
+    "loc_her": ("Ηράκλειο (HER)", "heraklion_airport", "HER"),
+    "loc_chq": ("Χανιά (CHQ)", "chania_airport", "CHQ"),
+    "loc_jtr": ("Σαντορίνη (JTR)", "santorini_airport", "JTR"),
+    "loc_ath": ("Αθήνα (ATH)", "athens_airport", "ATH")
 }
 
 DURATIONS = {
@@ -37,7 +36,7 @@ DURATIONS = {
 
 async def start_dummy_server():
     async def handle_ping(request):
-        return web.Response(text="Carsniper Live Engine Active")
+        return web.Response(text="Carsniper Engine Running")
     server = web.Application()
     server.router.add_get("/", handle_ping)
     server.router.add_get("/healthz", handle_ping)
@@ -52,7 +51,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📍 Σαντορίνη (JTR)", callback_data="loc_jtr"), InlineKeyboardButton("📍 Αθήνα (ATH)", callback_data="loc_ath")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    msg = "🚗 **Carsniper Bot (DoYouSpain True Engine)**\nΕπιλέξτε τοποθεσία αναζήτησης τιμών:"
+    msg = "🚗 **Carsniper Live Bot**\nΕπιλέξτε τοποθεσία αναζήτησης τιμών:"
     if update.message:
         await update.message.reply_text(msg, reply_markup=reply_markup, parse_mode="Markdown")
     else:
@@ -64,7 +63,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
 
     if data.startswith("loc_"):
-        context.user_data["loc_name"], context.user_data["loc_code"], context.user_data["loc_desc"] = LOCATIONS[data]
+        context.user_data["loc_name"], context.user_data["loc_slug"], context.user_data["loc_iata"] = LOCATIONS[data]
         keyboard = [
             [InlineKeyboardButton("1 Ημέρα (Αύριο)", callback_data="dur_1")],
             [InlineKeyboardButton("3 Ημέρες", callback_data="dur_3")],
@@ -85,23 +84,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["days"] = days
         context.user_data["p_str"] = p_date.strftime("%d/%m/%Y")
         context.user_data["d_str"] = d_date.strftime("%d/%m/%Y")
-        context.user_data["p_iso"] = p_date.strftime("%Y-%m-%d")
-        context.user_data["d_iso"] = d_date.strftime("%Y-%m-%d")
 
-        keyboard = [[InlineKeyboardButton("🔍 Ανάκτηση Live Τιμών & Excel", callback_data="fetch_prices")]]
+        keyboard = [[InlineKeyboardButton("🔍 Ανάκτηση Τιμών & Excel", callback_data="fetch_prices")]]
         await query.edit_message_text(
-            f"📍 **{context.user_data['loc_name']}**\n📅 {context.user_data['p_str']} ➔ {context.user_data['d_str']} ({days} ημ.)\n\nΠατήστε για εκτέλεση:",
+            f"📍 **{context.user_data['loc_name']}**\n📅 {context.user_data['p_str']} ➔ {context.user_data['d_str']} ({days} ημ.)\n\nΠατήστε για άμεση εκτέλεση:",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode="Markdown"
         )
 
     elif data == "fetch_prices":
-        await query.edit_message_text("⏳ **Ανάκτηση πραγματικών τιμών DoYouSpain μέσω Cloud...**\nΕπεξεργασία δεδομένων.", parse_mode="Markdown")
+        await query.edit_message_text("⏳ **Ανάκτηση πραγματικών τιμών DoYouSpain...**\nΕκτέλεση ερωτήματος.", parse_mode="Markdown")
         
-        results = await fetch_doyouspain_true(context.user_data)
+        results = await fetch_doyouspain_api(context.user_data)
 
         if not results:
-            await query.message.reply_text("❌ Δεν βρέθηκαν διαθέσιμες τιμές για τις συγκεκριμένες ημερομηνίες. Δοκιμάστε ξανά με /start.")
+            await query.message.reply_text("❌ Προσωρινό σφάλμα επικοινωνίας με την υπηρεσία τιμών. Δοκιμάστε ξανά σε λίγο με /start.")
             return
 
         msg_lines = [f"🏆 **Top {min(10, len(results))} Live Αποτελέσματα ({context.user_data['loc_name']}):**\n"]
@@ -157,20 +154,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             caption="📊 Αναλυτικό αρχείο Excel με τα επικαιροποιημένα δεδομένα."
         )
 
-async def fetch_doyouspain_true(user_data):
+async def fetch_doyouspain_api(user_data):
     results = []
     days = max(user_data.get("days", 1), 1)
-    loc_desc = user_data.get("loc_desc", "Crete - Heraklion Airport")
+    loc_slug = user_data.get("loc_slug", "heraklion_airport")
     p_str = user_data.get("p_str")
     d_str = user_data.get("d_str")
 
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
-        "Accept": "*/*",
-        "Accept-Language": "en-GB,en;q=0.9,el;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
         "Referer": "https://www.doyouspain.com/",
-        "Origin": "https://www.doyouspain.com",
-        "X-Requested-With": "XMLHttpRequest"
     }
 
     suppliers_list = [
@@ -182,93 +177,92 @@ async def fetch_doyouspain_true(user_data):
 
     try:
         async with AsyncSession(impersonate="chrome120") as s:
-            # 1. Session Setup
-            await s.get("https://www.doyouspain.com/index.htm", headers=headers, timeout=15)
+            # 1. First landing query to generate session cookies
+            init_url = "https://www.doyouspain.com/index.htm"
+            await s.get(init_url, headers=headers, timeout=15)
 
-            # 2. Αποστολή Search Query
-            search_url = "https://www.doyouspain.com/do/search"
-            payload = {
-                "lugar_entrega": loc_desc,
-                "fecha_recogida": p_str,
-                "hora_recogida": "10:00",
-                "fecha_devolucion": d_str,
-                "hora_devolucion": "10:00",
-                "age": "30"
-            }
+            # 2. Call Direct Listing Engine with complete parameters
+            list_url = f"https://www.doyouspain.com/do/list/en?loc={loc_slug}&pickup={p_str}&pickup_time=10:00&dropoff={d_str}&dropoff_time=10:00&age=30"
+            resp = await s.get(list_url, headers=headers, timeout=25)
+            html = resp.text
 
-            resp = await s.post(search_url, data=payload, headers=headers, timeout=25, allow_redirects=True)
-            text_data = resp.text
+            # 3. Extract JSON object containing pre-rendered cars if available
+            script_data = re.findall(r'(\[\s*\{.*?"price".*?\}\s*\])', html, re.DOTALL)
+            if script_data:
+                for block in script_data:
+                    try:
+                        data = json.loads(block)
+                        for item in data:
+                            c_name = item.get("car_name") or item.get("name") or item.get("model") or "Economy Car"
+                            s_name = item.get("supplier_name") or item.get("supplier") or "Partner"
+                            p_tot = float(item.get("total_price") or item.get("price") or 0.0)
+                            if p_tot > 5.0:
+                                results.append({
+                                    "Vehicle": c_name,
+                                    "Supplier": s_name,
+                                    "Total_EUR": p_tot,
+                                    "Per_Day_EUR": round(p_tot / days, 2)
+                                })
+                    except Exception:
+                        continue
 
-            # 3. Εξαγωγή JSON / Script Data αν υπάρχουν
-            json_matches = re.findall(r'var\s+(?:carsData|resultsData|cars|vehicles)\s*=\s*(\[\{.*?\}\]);', text_data, re.DOTALL)
-            if json_matches:
-                try:
-                    parsed_cars = json.loads(json_matches[0])
-                    for item in parsed_cars[:15]:
-                        car_name = item.get("name") or item.get("model") or "Economy Car or similar"
-                        supplier = item.get("supplier") or item.get("vendor") or "Partner"
-                        total_price = float(item.get("price") or item.get("total") or 0.0)
-                        if total_price > 5.0:
-                            results.append({
-                                "Vehicle": car_name,
-                                "Supplier": supplier,
-                                "Total_EUR": total_price,
-                                "Per_Day_EUR": round(total_price / days, 2)
-                            })
-                except Exception:
-                    pass
-
-            # 4. Εξαγωγή από ενσωματωμένες τιμές HTML
+            # 4. Pattern extraction directly from rendered HTML components
             if not results:
-                # Αναζήτηση όλων των τιμών και ονομάτων οχημάτων
-                price_blocks = re.findall(r'([A-Za-z0-9\s\.\-]{3,30}(?:or similar|Group [A-Z]))[\s\S]{1,150}?(\d+[\.,]\d{2})\s*€', text_data, re.I)
+                items = re.findall(r'(?:deal|result|car)[^>]*?>([\s\S]{1,400}?View deal[\s\S]{1,200}?€)', html, re.I)
+                if not items:
+                    # Fallback extraction on pricing structures
+                    items = re.findall(r'([A-Za-z0-9\s\.\-]{3,40}(?:or similar|Group [A-Z]|Economy|Compact|Mini))[\s\S]{1,200}?(\d+[\.,]\d{2})\s*€', html, re.I)
+
                 seen = set()
+                for match in items:
+                    if isinstance(match, tuple):
+                        car_name, price_str = match
+                        p_val = float(price_str.replace(",", "."))
+                    else:
+                        text_chunk = match
+                        prices = re.findall(r'(\d+[\.,]\d{2})\s*€', text_chunk)
+                        if not prices:
+                            continue
+                        p_val = float(prices[0].replace(",", "."))
+                        car_name = "Economy Car or similar"
+                        for l in text_chunk.splitlines():
+                            l_str = l.strip()
+                            if "or similar" in l_str.lower() or any(b in l_str.lower() for b in ["fiat", "citroen", "vw", "toyota", "hyundai", "peugeot", "opel", "kia", "suzuki", "nissan"]):
+                                car_name = l_str
+                                break
 
-                if price_blocks:
-                    for car_raw, p_raw in price_blocks:
-                        p_val = float(p_raw.replace(",", "."))
-                        if 5.0 <= p_val <= 2500.0:
-                            car_name = car_raw.strip().replace("\n", " ")
-                            key = f"{car_name}_{p_val}"
-                            if key in seen:
-                                continue
-                            seen.add(key)
+                    if p_val < 5.0 or p_val > 2500.0:
+                        continue
 
-                            supplier = "DoYouSpain Partner"
-                            for sup in suppliers_list:
-                                if sup.lower() in text_data.lower():
-                                    supplier = sup
-                                    break
+                    supplier = "DoYouSpain Partner"
+                    for sup in suppliers_list:
+                        if sup.lower() in str(match).lower():
+                            supplier = sup
+                            break
 
-                            results.append({
-                                "Vehicle": car_name,
-                                "Supplier": supplier,
-                                "Total_EUR": p_val,
-                                "Per_Day_EUR": round(p_val / days, 2)
-                            })
-                else:
-                    # Generic Price Fallback
-                    generic_prices = re.findall(r'(\d+[\.,]\d{2})\s*€', text_data)
-                    for idx, p_raw in enumerate(generic_prices[:15]):
-                        p_val = float(p_raw.replace(",", "."))
-                        if 8.0 <= p_val <= 2000.0:
-                            results.append({
-                                "Vehicle": f"Economy Car Option {idx+1} or similar",
-                                "Supplier": suppliers_list[idx % len(suppliers_list)],
-                                "Total_EUR": p_val,
-                                "Per_Day_EUR": round(p_val / days, 2)
-                            })
+                    key = f"{car_name}_{p_val}"
+                    if key in seen:
+                        continue
+                    seen.add(key)
 
+                    results.append({
+                        "Vehicle": car_name.strip(),
+                        "Supplier": supplier,
+                        "Total_EUR": p_val,
+                        "Per_Day_EUR": round(p_val / days, 2)
+                    })
+
+            # 5. Price sorting & Ranking
             results.sort(key=lambda x: x["Total_EUR"])
-            final_results = []
+            final_list = []
             for idx, item in enumerate(results[:15], 1):
                 item["Rank"] = idx
-                final_results.append(item)
+                final_list.append(item)
 
-            return final_results
+            return final_list
 
     except Exception as e:
-        print(f"True Engine Error: {e}")
+        print(f"Fetch Error: {e}")
         return []
 
 async def main_async():
