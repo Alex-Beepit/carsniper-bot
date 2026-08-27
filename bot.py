@@ -22,17 +22,17 @@ LOCATION, PICKUP_DATE, DROP_DATE, CAR_TYPE = range(4)
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 PORT = int(os.getenv("PORT", 10000))
 
-LOC_CODES = {
-    "Ηράκλειο (HER)": "heraklion_airport",
-    "Χανιά (CHQ)": "chania_airport",
-    "Σαντορίνη (JTR)": "santorini_airport",
-    "Αθήνα (ATH)": "athens_airport"
+LOC_LOOKUP = {
+    "Ηράκλειο (HER)": "Heraklion",
+    "Χανιά (CHQ)": "Chania",
+    "Σαντορίνη (JTR)": "Santorini",
+    "Αθήνα (ATH)": "Athens"
 }
 
-# Web Server για το Render Free Tier
+# Web Server για να μένει ενεργό το Render
 async def start_dummy_server():
     async def handle_ping(request):
-        return web.Response(text="Carsniper is running!")
+        return web.Response(text="Carsniper Running")
 
     server = web.Application()
     server.router.add_get("/", handle_ping)
@@ -79,11 +79,7 @@ async def drop_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def scrape_doyouspain(params):
     results = []
-    
-    p_date = params.get("pickup", "28/08/2026").replace("-", "/")
-    d_date = params.get("drop", "29/08/2026").replace("-", "/")
-    loc_key = params.get("location", "Ηράκλειο (HER)")
-    loc_slug = LOC_CODES.get(loc_key, "heraklion_airport")
+    query_loc = LOC_LOOKUP.get(params.get("location", ""), params.get("location", "Heraklion"))
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -92,26 +88,52 @@ async def scrape_doyouspain(params):
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
-                "--disable-blink-features=AutomationControlled"
+                "--disable-web-security",
+                "--disable-features=IsolateOrigins,site-per-process"
             ]
         )
         context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
             viewport={"width": 1440, "height": 900},
-            locale="en-GB"
+            locale="el-GR"
         )
         page = await context.new_page()
 
         try:
-            target_url = f"https://www.doyouspain.com/do/list/en?loc={loc_slug}&pickup={p_date}&dropoff={d_date}"
-            await page.goto(target_url, wait_until="domcontentloaded", timeout=40000)
-            await page.wait_for_timeout(6000)
+            # 1. Μετάβαση στην κεντρική σελίδα για αρχικοποίηση session
+            await page.goto("https://www.doyouspain.com/", wait_until="networkidle", timeout=60000)
+            await page.wait_for_timeout(2000)
 
-            # Εύρεση καρτών αποτελεσμάτων
-            cards = await page.locator("xpath=//div[contains(., '€') and (contains(., 'View deal') or contains(., 'Price for') or contains(., 'or similar'))]").all()
-            
+            # Αποδοχή cookies αν εμφανιστεί
+            try:
+                cookie_btn = page.locator("#onetrust-accept-btn-handler, button:has-text('Accept'), button:has-text('Accept All')").first
+                if await cookie_btn.count() > 0:
+                    await cookie_btn.click()
+                    await page.wait_for_timeout(1000)
+            except Exception:
+                pass
+
+            # 2. Συμπλήρωση πεδίου τοποθεσίας
+            input_box = page.locator("#place_origen_des, input[name='lugar_entrega'], input[id*='origen'], input[type='text']").first
+            await input_box.click()
+            await input_box.fill(query_loc)
+            await page.wait_for_timeout(1500)
+            await page.keyboard.press("ArrowDown")
+            await page.keyboard.press("Enter")
+            await page.wait_for_timeout(1000)
+
+            # 3. Εκτέλεση αναζήτησης
+            btn = page.locator("#btnBuscar, button[type='submit'], input[type='submit']").first
+            await btn.click()
+
+            # 4. Αναμονή για τη σελίδα αποτελεσμάτων
+            await page.wait_for_selector("text=View deal", timeout=45000)
+            await page.wait_for_timeout(4000)
+
+            # 5. Εξαγωγή στοιχείων από τις κάρτες
+            cards = await page.locator("xpath=//a[contains(., 'View deal')]/ancestor::div[contains(@class, 'deal') or contains(@class, 'card') or contains(@class, 'result') or position()=1]").all()
             if not cards:
-                cards = await page.locator("div[class*='deal'], div[class*='car'], div[class*='result']").all()
+                cards = await page.locator("div[class*='deal'], div[class*='result'], div[class*='car-']").all()
 
             rank = 1
             seen = set()
@@ -128,11 +150,11 @@ async def scrape_doyouspain(params):
                 price_main = float(prices[0].replace(",", "."))
                 price_day = float(prices[1].replace(",", ".")) if len(prices) > 1 else price_main
 
-                car_name = "Mini / Economy Car"
-                lines = [line.strip() for line in text.split("\n") if line.strip()]
-                for l in lines:
-                    if "or similar" in l.lower() or any(b in l.lower() for b in ["fiat", "citroen", "vw", "toyota", "hyundai", "peugeot", "opel", "renault", "skoda", "nissan", "kia"]):
-                        car_name = l
+                car_name = "Car Model"
+                for l in text.split("\n"):
+                    l_clean = l.strip()
+                    if "or similar" in l_clean.lower() or any(b in l_clean.lower() for b in ["fiat", "citroen", "vw", "toyota", "hyundai", "peugeot", "opel", "renault", "skoda", "nissan", "kia"]):
+                        car_name = l_clean
                         break
 
                 key = f"{car_name}_{price_main}"
@@ -140,7 +162,7 @@ async def scrape_doyouspain(params):
                     continue
                 seen.add(key)
 
-                supplier = "DoYouSpain Partner"
+                supplier = "Partner"
                 for s in ["Surprice", "Abbycar", "addCar", "AutoUnion", "Autocar", "Avance", "Avis", "Beepit", "Caldera", "CarRental2Greece", "Carwiz", "Centauro", "Cretamotor", "Enterprise", "Europcar", "Exer", "Flex", "Goldcar", "Green Motion", "Grentals", "Hertz", "Sixt", "OK Mobility"]:
                     if s.lower() in text.lower():
                         supplier = s
@@ -156,7 +178,7 @@ async def scrape_doyouspain(params):
                 rank += 1
 
         except Exception as e:
-            print(f"Extraction error: {e}")
+            print(f"Scrape Exception: {e}")
         finally:
             await browser.close()
 
@@ -164,7 +186,7 @@ async def scrape_doyouspain(params):
 
 async def car_type_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["car_type"] = update.message.text
-    await update.message.reply_text("⏳ Αναζήτηση ζωντανών τιμών στο DoYouSpain... Παρακαλώ περιμένετε.")
+    await update.message.reply_text("⏳ Αναζήτηση ζωντανών τιμών στο DoYouSpain... Παρακαλώ περιμένετε 15-20 δευτερόλεπτα.")
 
     data = await scrape_doyouspain(context.user_data)
 
@@ -181,7 +203,6 @@ async def car_type_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     await update.message.reply_text("\n".join(msg_lines), parse_mode="Markdown")
 
-    # Δημιουργία ODS / Excel αρχείου
     df = pd.DataFrame(data)
     df.columns = ["Κατάταξη", "Όχημα / Μοντέλο", "Εταιρεία", "Συνολική Τιμή (€)", "Τιμή ανά Ημέρα (€)"]
     
