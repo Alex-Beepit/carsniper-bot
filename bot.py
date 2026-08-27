@@ -2,6 +2,7 @@ import os
 import io
 import asyncio
 import re
+import urllib.parse
 import pandas as pd
 from datetime import datetime
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
@@ -18,10 +19,10 @@ from playwright.async_api import async_playwright
 LOCATION, PICKUP_DATE, DROP_DATE, CAR_TYPE = range(4)
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 
-# Mapping βασικών τοποθεσιών για σωστή συμπλήρωση στο DoYouSpain
+# Χαρτογράφηση γνωστών τοποθεσιών
 LOC_MAP = {
-    "Ηράκλειο (HER)": "Crete, Heraklion Airport",
-    "Χανιά (CHQ)": "Crete, Chania Airport",
+    "Ηράκλειο (HER)": "Crete - Heraklion Airport",
+    "Χανιά (CHQ)": "Crete - Chania Airport",
     "Σαντορίνη (JTR)": "Santorini Airport",
     "Αθήνα (ATH)": "Athens Airport"
 }
@@ -29,7 +30,7 @@ LOC_MAP = {
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_keyboard = [["Ηράκλειο (HER)", "Χανιά (CHQ)"], ["Σαντορίνη (JTR)", "Αθήνα (ATH)"]]
     await update.message.reply_text(
-        "🚗 **Carsniper Bot**\nΕπιλέξτε τοποθεσία ή πληκτρολογήστε σημείο παραλαβής:",
+        "🚗 **Carsniper Bot**\nΕπιλέξτε τοποθεσία ή πληκτρολογήστε σημείο:",
         reply_markup=ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True, resize_keyboard=True),
         parse_mode="Markdown"
     )
@@ -39,7 +40,7 @@ async def location_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     loc_input = update.message.text
     context.user_data["location"] = LOC_MAP.get(loc_input, loc_input)
     await update.message.reply_text(
-        "📅 Δώστε ημερομηνία & ώρα **Παραλαβής** (π.χ. `15/09/2026 10:00`):",
+        "📅 Δώστε ημερομηνία **Παραλαβής** (π.χ. `27/08/2026`):",
         reply_markup=ReplyKeyboardRemove(),
         parse_mode="Markdown"
     )
@@ -48,7 +49,7 @@ async def location_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def pickup_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["pickup"] = update.message.text
     await update.message.reply_text(
-        "📅 Δώστε ημερομηνία & ώρα **Παράδοσης** (π.χ. `22/09/2026 10:00`):",
+        "📅 Δώστε ημερομηνία **Παράδοσης** (π.χ. `29/08/2026`):",
         parse_mode="Markdown"
     )
     return DROP_DATE
@@ -67,76 +68,99 @@ async def scrape_doyouspain(params):
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
-            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled"
+            ]
         )
         context = await browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-            viewport={"width": 1280, "height": 800}
+            viewport={"width": 1366, "height": 768},
+            locale="en-GB"
         )
         page = await context.new_page()
 
         try:
-            # Μετάβαση στην κεντρική φόρμα αναζήτησης
-            await page.goto("https://www.doyouspain.com/index.htm", wait_until="domcontentloaded", timeout=60000)
+            # Μετάβαση στο DoYouSpain
+            await page.goto("https://www.doyouspain.com/", wait_until="domcontentloaded", timeout=45000)
+            await page.wait_for_timeout(2000)
 
-            # Συμπλήρωση τοποθεσίας
-            loc_input = page.locator("#place_origen_des, input[name*='place'], input[id*='place']")
+            # Εισαγωγή τοποθεσίας
+            loc_input = page.locator("#place_origen_des, input[name='lugar_entrega'], input[id*='origen']").first
             if await loc_input.count() > 0:
-                await loc_input.first.fill(params.get("location", "Crete, Heraklion Airport"))
+                await loc_input.click()
+                await loc_input.fill(params.get("location", "Crete - Heraklion Airport"))
+                await page.wait_for_timeout(1000)
                 await page.keyboard.press("ArrowDown")
                 await page.keyboard.press("Enter")
-                await page.wait_for_timeout(1000)
 
-            # Υποβολή φόρμας αναζήτησης
-            search_btn = page.locator("#btnBuscar, input[type='submit'], button[type='submit']").first
+            # Κλικ αναζήτησης
+            search_btn = page.locator("#btnBuscar, button[type='submit'], input[type='submit']").first
             if await search_btn.count() > 0:
                 await search_btn.click()
 
-            # Αναμονή εμφάνισης αποτελεσμάτων
-            await page.wait_for_selector(".results-car-item, .car-box, div[class*='deal'], div[class*='result'], div[class*='card']", timeout=40000)
-            await page.wait_for_timeout(3000)
+            # Αναμονή για τη σελίδα αποτελεσμάτων
+            await page.wait_for_selector("a:has-text('View deal'), button:has-text('View deal'), div:has-text('Price for')", timeout=35000)
+            await page.wait_for_timeout(4000)
 
-            car_cards = await page.locator("div[class*='deal-card'], div[class*='car-result'], div[class*='results-car-item'], div[class*='car-box']").all()
+            # Εντοπισμός όλων των προσφορών
+            # Το DoYouSpain ομαδοποιεί τα deals γύρω από το κουμπί "View deal"
+            deals = await page.locator("xpath=//a[contains(., 'View deal')]/ancestor::div[contains(@class, 'deal') or contains(@class, 'box') or contains(@class, 'card') or position()=1]").all()
+
+            if not deals:
+                # Εναλλακτικός τρόπος εντοπισμού καρτών
+                deals = await page.locator("div[class*='deal'], div[class*='result'], div[class*='car-']").all()
 
             rank = 1
-            for card in car_cards:
+            seen_vehicles = set()
+
+            for deal in deals:
                 if rank > 10:
                     break
-                text_content = await card.inner_text()
+                text = await deal.inner_text()
                 
-                # Εξαγωγή μοντέλου οχήματος
-                title_elem = card.locator("h3, h4, .car-name, .model-name").first
-                vehicle = await title_elem.inner_text() if await title_elem.count() > 0 else f"Vehicle Option {rank}"
-                vehicle = vehicle.split("\n")[0].strip()
+                # Αναζήτηση τιμής (π.χ. 16,11 €)
+                price_matches = re.findall(r'(\d+[\.,]\d{2})\s*€', text)
+                if not price_matches:
+                    continue
 
-                # Εξαγωγή προμηθευτή
-                supplier = "DoYouSpain Partner"
-                supplier_img = card.locator("img[class*='supplier'], img[class*='logo']").first
-                if await supplier_img.count() > 0:
-                    alt_text = await supplier_img.get_attribute("alt")
-                    if alt_text:
-                        supplier = alt_text
+                price_main = float(price_matches[0].replace(",", "."))
+                price_day = float(price_matches[1].replace(",", ".")) if len(price_matches) > 1 else price_main
 
-                # Εξαγωγή πραγματικών τιμών με regex
-                prices = re.findall(r'(\d+[\.,]\d{2})\s*€', text_content)
-                if prices:
-                    price_val = float(prices[0].replace(",", "."))
-                    price_day = float(prices[1].replace(",", ".")) if len(prices) > 1 else price_val
-                else:
-                    price_val = 0.0
-                    price_day = 0.0
+                # Εξαγωγή ονόματος οχήματος (π.χ. Fiat 500 or similar)
+                car_name = "Car"
+                lines = [line.strip() for line in text.split("\n") if line.strip()]
+                for l in lines:
+                    if "or similar" in l.lower() or any(brand in l.lower() for brand in ["fiat", "citroen", "vw", "toyota", "hyundai", "peugeot", "opel", "renault", "skoda", "nissan", "kia"]):
+                        car_name = l
+                        break
+
+                # Αποφυγή διπλότυπων καρτών
+                deal_key = f"{car_name}_{price_main}"
+                if deal_key in seen_vehicles:
+                    continue
+                seen_vehicles.add(deal_key)
+
+                # Εξαγωγή εταιρείας (Surprice, Abbycar, Beepit, etc)
+                supplier = "Partner Supplier"
+                for s_name in ["Surprice", "Abbycar", "addCar", "AutoUnion", "Autocar", "Avance", "Avis", "Beepit", "Caldera", "CarRental2Greece", "Carwiz", "Centauro", "Cretamotor", "Enterprise", "EuroCar", "Europcar", "Exer", "Flex", "Goldcar", "Green Motion", "Grentals", "Hertz", "OK Mobility", "Record go", "Rhodium", "Sixt", "Thrifty", "Wheego", "Windy"]:
+                    if s_name.lower() in text.lower():
+                        supplier = s_name
+                        break
 
                 results.append({
                     "Rank": rank,
-                    "Vehicle": vehicle,
+                    "Vehicle": car_name,
                     "Supplier": supplier,
-                    "Price_Total_EUR": price_val,
+                    "Price_Total_EUR": price_main,
                     "Price_Per_Day_EUR": price_day
                 })
                 rank += 1
 
         except Exception as e:
-            print(f"Scraping Error: {e}")
+            print(f"Extraction Error: {e}")
         finally:
             await browser.close()
 
@@ -144,12 +168,12 @@ async def scrape_doyouspain(params):
 
 async def car_type_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["car_type"] = update.message.text
-    await update.message.reply_text("⏳ Αναζήτηση ζωντανών τιμών στο DoYouSpain... Παρακαλώ περιμένετε.")
+    await update.message.reply_text("⏳ Αναζήτηση ζωντανών τιμών στο DoYouSpain... Παρακαλώ περιμένετε 10-15 δευτερόλεπτα.")
 
     data = await scrape_doyouspain(context.user_data)
 
     if not data:
-        await update.message.reply_text("❌ Δεν βρέθηκαν αποτελέσματα. Δοκιμάστε ξανά.")
+        await update.message.reply_text("❌ Δεν ήταν δυνατή η ανάκτηση των τιμών. Δοκιμάστε ξανά.")
         return ConversationHandler.END
 
     msg_lines = ["🏆 **Top 10 Αποτελέσματα (DoYouSpain Live):**\n"]
@@ -157,7 +181,7 @@ async def car_type_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg_lines.append(
             f"**{row['Rank']}. {row['Vehicle']}**\n"
             f"• Εταιρεία: `{row['Supplier']}`\n"
-            f"• Σύνολο: **{row['Price_Total_EUR']}€** ({row['Price_Per_Day_EUR']}€/ημέρα)\n"
+            f"• Τιμή: **{row['Price_Total_EUR']}€**\n"
         )
     await update.message.reply_text("\n".join(msg_lines), parse_mode="Markdown")
 
