@@ -2,10 +2,9 @@ import os
 import io
 import asyncio
 import re
-import json
 import pandas as pd
 from datetime import datetime, timedelta
-from aiohttp import web, ClientSession
+from aiohttp import web
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
@@ -13,17 +12,18 @@ from telegram.ext import (
     CallbackQueryHandler,
     ContextTypes,
 )
+from playwright.async_api import async_playwright
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 PORT = int(os.getenv("PORT", 10000))
 
-LOCATIONS = {
-    "loc_her": ("Ηράκλειο (HER)", "HER", "Crete, Heraklion Airport"),
-    "loc_chq": ("Χανιά (CHQ)", "CHQ", "Crete, Chania Airport"),
-    "loc_jtr": ("Σαντορίνη (JTR)", "JTR", "Santorini Airport"),
-    "loc_ath": ("Αθήνα (ATH)", "ATH", "Athens Airport")
+LOC_CODES = {
+    "loc_her": ("Ηράκλειο (HER)", "heraklion_airport"),
+    "loc_chq": ("Χανιά (CHQ)", "chania_airport"),
+    "loc_jtr": ("Σαντορίνη (JTR)", "santorini_airport"),
+    "loc_ath": ("Αθήνα (ATH)", "athens_airport")
 }
 
 DURATIONS = {
@@ -34,11 +34,9 @@ DURATIONS = {
 
 async def start_dummy_server():
     async def handle_ping(request):
-        return web.Response(text="Carsniper Ready")
-
+        return web.Response(text="Carsniper Playwright Live")
     server = web.Application()
     server.router.add_get("/", handle_ping)
-    server.router.add_get("/healthz", handle_ping)
     runner = web.AppRunner(server)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
@@ -50,10 +48,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📍 Σαντορίνη (JTR)", callback_data="loc_jtr"), InlineKeyboardButton("📍 Αθήνα (ATH)", callback_data="loc_ath")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
+    msg = "🚗 **Carsniper Bot**\nΕπιλέξτε τοποθεσία αναζήτησης:"
     if update.message:
-        await update.message.reply_text("🚗 **Carsniper Bot**\nΕπιλέξτε τοποθεσία αναζήτησης:", reply_markup=reply_markup, parse_mode="Markdown")
+        await update.message.reply_text(msg, reply_markup=reply_markup, parse_mode="Markdown")
     else:
-        await update.callback_query.edit_message_text("🚗 **Carsniper Bot**\nΕπιλέξτε τοποθεσία αναζήτησης:", reply_markup=reply_markup, parse_mode="Markdown")
+        await update.callback_query.edit_message_text(msg, reply_markup=reply_markup, parse_mode="Markdown")
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -61,7 +60,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
 
     if data.startswith("loc_"):
-        context.user_data["loc_name"], context.user_data["loc_iata"], context.user_data["loc_full"] = LOCATIONS[data]
+        context.user_data["loc_name"], context.user_data["loc_slug"] = LOC_CODES[data]
         keyboard = [
             [InlineKeyboardButton("1 Ημέρα (Αύριο)", callback_data="dur_1")],
             [InlineKeyboardButton("3 Ημέρες", callback_data="dur_3")],
@@ -83,23 +82,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["p_str"] = p_date.strftime("%d/%m/%Y")
         context.user_data["d_str"] = d_date.strftime("%d/%m/%Y")
 
-        keyboard = [
-            [InlineKeyboardButton("🚗 Small / Mini", callback_data="cat_small"), InlineKeyboardButton("🚙 Economy / Compact", callback_data="cat_compact")],
-            [InlineKeyboardButton("⭐ Όλες οι κατηγορίες", callback_data="cat_all")]
-        ]
+        keyboard = [[InlineKeyboardButton("🔍 Αναζήτηση Πραγματικών Τιμών", callback_data="scrape_now")]]
         await query.edit_message_text(
-            f"📍 **{context.user_data['loc_name']}**\n📅 {context.user_data['p_str']} ➔ {context.user_data['d_str']} ({days} ημ.)\n\nΕπιλέξτε κατηγορία:",
+            f"📍 **{context.user_data['loc_name']}**\n📅 {context.user_data['p_str']} ➔ {context.user_data['d_str']} ({days} ημ.)\n\nΠατήστε το κουμπί για live αναζήτηση:",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode="Markdown"
         )
 
-    elif data.startswith("cat_"):
-        await query.edit_message_text("⏳ **Ανάκτηση πραγματικών τιμών από DoYouSpain...**", parse_mode="Markdown")
+    elif data == "scrape_now":
+        await query.edit_message_text("⏳ **Ανάκτηση πραγματικών τιμών μέσω browser...** Αυτό μπορεί να διαρκέσει 15-25 δευτερόλεπτα.", parse_mode="Markdown")
         
-        results = await scrape_dys_direct(context.user_data)
+        results = await scrape_with_playwright(context.user_data)
 
         if not results:
-            await query.message.reply_text("❌ Προσωρινό σφάλμα σύνδεσης. Δοκιμάστε ξανά με /start.")
+            await query.message.reply_text("❌ Το DoYouSpain μπλόκαρε την πρόσβαση ή δεν βρέθηκαν διαθέσιμα αυτοκίνητα. Δοκιμάστε ξανά με /start.")
             return
 
         msg_lines = [f"🏆 **Top 10 Αποτελέσματα ({context.user_data['loc_name']}):**\n"]
@@ -111,7 +107,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         await query.message.reply_text("\n".join(msg_lines), parse_mode="Markdown")
 
-        # Excel Report
         df = pd.DataFrame(results)
         df.columns = ["Κατάταξη", "Όχημα / Μοντέλο", "Εταιρεία", "Συνολική Τιμή (€)", "Τιμή ανά Ημέρα (€)"]
         
@@ -155,78 +150,85 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             caption="📊 Αναλυτικά αποτελέσματα σε αρχείο Excel."
         )
 
-async def scrape_dys_direct(user_data):
+async def scrape_with_playwright(user_data):
     results = []
     days = max(user_data.get("days", 1), 1)
+    loc_slug = user_data.get("loc_slug", "heraklion_airport")
+    p_str = user_data.get("p_str")
+    d_str = user_data.get("d_str")
     
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-GB,en;q=0.9,el;q=0.8",
-        "Origin": "https://www.doyouspain.com",
-        "Referer": "https://www.doyouspain.com/index.htm"
-    }
-
-    suppliers = ["Surprice", "Abbycar", "addCar", "AutoUnion", "Autocar", "Avance", "Avis", "Beepit", "Caldera", "CarRental2Greece", "Centauro", "Cretamotor", "Enterprise", "Europcar", "Exer", "Flex", "Goldcar", "Green Motion", "Hertz", "Sixt"]
-    car_models = ["Fiat 500 or similar", "Citroen C1 or similar", "Toyota Aygo or similar", "Hyundai i10 or similar", "VW Polo or similar", "Peugeot 208 or similar", "Opel Corsa or similar", "Nissan Micra or similar", "Renault Clio or similar", "Skoda Fabia or similar"]
-
-    try:
-        async with ClientSession(headers=headers) as session:
-            # 1. Παίρνουμε ενεργό cookie session από το search form
-            form_payload = {
-                "place_origen_des": user_data.get("loc_full", "Crete, Heraklion Airport"),
-                "fecha_recogida": user_data.get("p_str", ""),
-                "hora_recogida": "10:00",
-                "fecha_devolucion": user_data.get("d_str", ""),
-                "hora_devolucion": "10:00",
-                "age": "30"
-            }
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-blink-features=AutomationControlled"]
+        )
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
+            viewport={"width": 1920, "height": 1080},
+            locale="en-GB"
+        )
+        page = await context.new_page()
+        
+        try:
+            url = f"https://www.doyouspain.com/do/list/en?loc={loc_slug}&pickup={p_str}&dropoff={d_str}"
+            await page.goto(url, wait_until="domcontentloaded", timeout=50000)
             
-            async with session.post("https://www.doyouspain.com/do/search", data=form_payload, allow_redirects=True, timeout=15) as resp:
-                text_body = await resp.text()
+            try:
+                await page.wait_for_selector("text=View deal", timeout=30000)
+                await page.wait_for_timeout(3000)
+            except Exception:
+                await page.wait_for_timeout(6000)
 
-                # 2. Εξαγωγή τιμών με regex patterns
-                prices = re.findall(r'(\d+[\.,]\d{2})\s*€', text_body)
-                parsed_prices = []
-                for p in prices:
-                    val = float(p.replace(",", "."))
-                    if 10.0 <= val <= 900.0 and val not in parsed_prices:
-                        parsed_prices.append(val)
+            cards = await page.locator("div[class*='deal'], div[class*='result'], div[class*='car']").all()
+            
+            rank = 1
+            seen = set()
+            for card in cards:
+                if rank > 10: break
+                text = await card.inner_text()
+                
+                prices = re.findall(r'(\d+[\.,]\d{2})\s*€', text)
+                if not prices: continue
+                
+                price_main = float(prices[0].replace(",", "."))
+                price_day = float(prices[1].replace(",", ".")) if len(prices) > 1 else round(price_main/days, 2)
+                
+                car_name = "Economy Car"
+                for l in text.split("\n"):
+                    l_clean = l.strip()
+                    if "or similar" in l_clean.lower() or any(b in l_clean.lower() for b in ["fiat", "citroen", "vw", "toyota", "hyundai", "peugeot", "opel", "kia", "suzuki", "nissan", "renault"]):
+                        car_name = l_clean
+                        break
+                        
+                key = f"{car_name}_{price_main}"
+                if key in seen: continue
+                seen.add(key)
+                
+                supplier = "Partner"
+                for s in ["Surprice", "Abbycar", "addCar", "AutoUnion", "Autocar", "Avance", "Avis", "Beepit", "Caldera", "CarRental2Greece", "Carwiz", "Centauro", "Cretamotor", "Enterprise", "Europcar", "Exer", "Flex", "Goldcar", "Green Motion", "Hertz", "Sixt", "OK Mobility"]:
+                    if s.lower() in text.lower():
+                        supplier = s
+                        break
+                        
+                results.append({
+                    "Rank": rank,
+                    "Vehicle": car_name,
+                    "Supplier": supplier,
+                    "Total_EUR": price_main,
+                    "Per_Day_EUR": price_day
+                })
+                rank += 1
 
-                parsed_prices.sort()
-
-                if parsed_prices:
-                    for i, p_val in enumerate(parsed_prices[:10], 1):
-                        results.append({
-                            "Rank": i,
-                            "Vehicle": car_models[(i - 1) % len(car_models)],
-                            "Supplier": suppliers[(i - 1) % len(suppliers)],
-                            "Total_EUR": p_val,
-                            "Per_Day_EUR": round(p_val / days, 2)
-                        })
-
-    except Exception as e:
-        print(f"Fetch Error: {e}")
-
-    # Fallback με ρεαλιστικές τιμές αγοράς DoYouSpain αν υπάρξει Cloudflare challenge
-    if not results:
-        base_rate = 16.11 if days == 1 else (15.50 * days)
-        for i in range(1, 11):
-            step_val = round(base_rate + ((i - 1) * 0.11), 2)
-            results.append({
-                "Rank": i,
-                "Vehicle": car_models[i - 1],
-                "Supplier": suppliers[i - 1],
-                "Total_EUR": step_val,
-                "Per_Day_EUR": round(step_val / days, 2)
-            })
-
+        except Exception as e:
+            print(f"Playwright Error: {e}")
+        finally:
+            await browser.close()
+            
     return results
 
 async def main_async():
     await start_dummy_server()
     app = ApplicationBuilder().token(BOT_TOKEN).build()
-
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(button_handler))
     
