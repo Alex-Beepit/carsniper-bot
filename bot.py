@@ -2,7 +2,6 @@ import os
 import io
 import asyncio
 import re
-import random
 import pandas as pd
 from datetime import datetime, timedelta
 from aiohttp import web
@@ -13,32 +12,33 @@ from telegram.ext import (
     CallbackQueryHandler,
     ContextTypes,
 )
-from playwright.async_api import async_playwright
-from playwright_stealth import stealth_async
+from curl_cffi.requests import AsyncSession
+from bs4 import BeautifulSoup
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8235978247:AAFDVmjSmcHkvptIHI5YLZlLkemzvp9t-pE")
 PORT = int(os.getenv("PORT", 10000))
 
-LOC_CODES = {
-    "loc_her": ("Ηράκλειο (HER)", "heraklion_airport"),
-    "loc_chq": ("Χανιά (CHQ)", "chania_airport"),
-    "loc_jtr": ("Σαντορίνη (JTR)", "santorini_airport"),
-    "loc_ath": ("Αθήνα (ATH)", "athens_airport")
+LOCATIONS = {
+    "loc_her": ("Ηράκλειο (HER)", "Crete - Heraklion Airport"),
+    "loc_chq": ("Χανιά (CHQ)", "Crete - Chania Airport"),
+    "loc_jtr": ("Σαντορίνη (JTR)", "Santorini - Airport"),
+    "loc_ath": ("Αθήνα (ATH)", "Athens - Airport")
 }
 
 DURATIONS = {
-    "dur_1": ("1 Ημέρα", 1),
+    "dur_1": ("1 Ημέρα (Αύριο)", 1),
     "dur_3": ("3 Ημέρες", 3),
-    "dur_7": ("7 Ημέρες", 7),
+    "dur_7": ("7 Ημέρες (1 Εβδομάδα)", 7),
 }
 
 async def start_dummy_server():
     async def handle_ping(request):
-        return web.Response(text="Carsniper Xvfb Live")
+        return web.Response(text="Carsniper Cloud Engine Active")
     server = web.Application()
     server.router.add_get("/", handle_ping)
+    server.router.add_get("/healthz", handle_ping)
     runner = web.AppRunner(server)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
@@ -50,7 +50,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📍 Σαντορίνη (JTR)", callback_data="loc_jtr"), InlineKeyboardButton("📍 Αθήνα (ATH)", callback_data="loc_ath")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    msg = "🚗 **Carsniper Bot**\nΕπιλέξτε τοποθεσία αναζήτησης:"
+    msg = "🚗 **Carsniper Bot**\nΕπιλέξτε τοποθεσία αναζήτησης τιμών:"
     if update.message:
         await update.message.reply_text(msg, reply_markup=reply_markup, parse_mode="Markdown")
     else:
@@ -62,7 +62,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
 
     if data.startswith("loc_"):
-        context.user_data["loc_name"], context.user_data["loc_slug"] = LOC_CODES[data]
+        context.user_data["loc_name"], context.user_data["loc_query"] = LOCATIONS[data]
         keyboard = [
             [InlineKeyboardButton("1 Ημέρα (Αύριο)", callback_data="dur_1")],
             [InlineKeyboardButton("3 Ημέρες", callback_data="dur_3")],
@@ -84,23 +84,23 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["p_str"] = p_date.strftime("%d/%m/%Y")
         context.user_data["d_str"] = d_date.strftime("%d/%m/%Y")
 
-        keyboard = [[InlineKeyboardButton("🔍 Αναζήτηση Πραγματικών Τιμών", callback_data="scrape_now")]]
+        keyboard = [[InlineKeyboardButton("🔍 Ανάκτηση Τιμών & Excel", callback_data="fetch_prices")]]
         await query.edit_message_text(
-            f"📍 **{context.user_data['loc_name']}**\n📅 {context.user_data['p_str']} ➔ {context.user_data['d_str']} ({days} ημ.)\n\nΠατήστε το κουμπί για live αναζήτηση:",
+            f"📍 **{context.user_data['loc_name']}**\n📅 {context.user_data['p_str']} ➔ {context.user_data['d_str']} ({days} ημ.)\n\nΠατήστε για άμεση εκτέλεση:",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode="Markdown"
         )
 
-    elif data == "scrape_now":
-        await query.edit_message_text("⏳ **Ανάκτηση μέσω εικονικής οθόνης (Bypassing Cloudflare)...** \nΠαρακαλώ περιμένετε 20-30 δευτερόλεπτα.", parse_mode="Markdown")
+    elif data == "fetch_prices":
+        await query.edit_message_text("⏳ **Ανάκτηση πραγματικών δεδομένων DoYouSpain μέσω Cloud...**", parse_mode="Markdown")
         
-        results = await scrape_with_playwright(context.user_data)
+        results = await fetch_doyouspain_cloud(context.user_data)
 
         if not results:
-            await query.message.reply_text("❌ Η αναζήτηση απέτυχε. Το σύστημα ασφαλείας είναι ενεργό. Δοκιμάστε ξανά σε 5 λεπτά με /start.")
+            await query.message.reply_text("❌ Προσωρινό σφάλμα ανάκτησης. Δοκιμάστε ξανά με /start.")
             return
 
-        msg_lines = [f"🏆 **Top 10 Αποτελέσματα ({context.user_data['loc_name']}):**\n"]
+        msg_lines = [f"🏆 **Top 10 Live Αποτελέσματα ({context.user_data['loc_name']}):**\n"]
         for row in results[:10]:
             msg_lines.append(
                 f"**{row['Rank']}. {row['Vehicle']}**\n"
@@ -109,13 +109,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         await query.message.reply_text("\n".join(msg_lines), parse_mode="Markdown")
 
+        # Excel Report
         df = pd.DataFrame(results)
         df.columns = ["Κατάταξη", "Όχημα / Μοντέλο", "Εταιρεία", "Συνολική Τιμή (€)", "Τιμή ανά Ημέρα (€)"]
         
         excel_buffer = io.BytesIO()
         with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
-            df.to_excel(writer, index=False, sheet_name="DoYouSpain")
-            worksheet = writer.sheets["DoYouSpain"]
+            df.to_excel(writer, index=False, sheet_name="DoYouSpain_Live")
+            worksheet = writer.sheets["DoYouSpain_Live"]
 
             header_fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
             header_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
@@ -149,98 +150,107 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chat_id=query.message.chat_id,
             document=excel_buffer,
             filename=filename,
-            caption="📊 Αναλυτικά αποτελέσματα σε αρχείο Excel."
+            caption="📊 Αναλυτικό Excel με τα επικαιροποιημένα δεδομένα."
         )
 
-async def scrape_with_playwright(user_data):
+async def fetch_doyouspain_cloud(user_data):
     results = []
     days = max(user_data.get("days", 1), 1)
-    loc_slug = user_data.get("loc_slug", "heraklion_airport")
+    loc_query = user_data.get("loc_query", "Crete - Heraklion Airport")
     p_str = user_data.get("p_str")
     d_str = user_data.get("d_str")
-    
-    async with async_playwright() as p:
-        # ΤΟ ΑΠΟΛΥΤΟ ΜΥΣΤΙΚΟ ΕΙΝΑΙ ΕΔΩ: headless=False
-        browser = await p.chromium.launch(
-            headless=False,
-            args=[
-                "--no-sandbox", 
-                "--disable-setuid-sandbox", 
-                "--disable-blink-features=AutomationControlled",
-                "--window-size=1920,1080"
-            ]
-        )
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
-            viewport={"width": 1920, "height": 1080},
-            locale="el-GR",
-            timezone_id="Europe/Athens"
-        )
-        page = await context.new_page()
-        
-        await stealth_async(page)
-        
-        try:
-            await asyncio.sleep(random.uniform(1.0, 2.5))
-            
-            url = f"https://www.doyouspain.com/do/list/en?loc={loc_slug}&pickup={p_str}&dropoff={d_str}"
-            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            
-            # Έξτρα χρόνος αν εμφανιστεί ο κύκλος φόρτωσης του Cloudflare
-            await page.wait_for_timeout(6000)
-            await page.mouse.wheel(0, 700)
-            await asyncio.sleep(random.uniform(2.0, 3.0))
-            
-            try:
-                await page.wait_for_selector("text=View deal", timeout=30000)
-            except Exception:
-                await page.wait_for_timeout(5000)
 
-            cards = await page.locator("div[class*='deal'], div[class*='result'], div[class*='car']").all()
+    try:
+        async with AsyncSession(impersonate="chrome120") as s:
+            # 1. Handshake με την αρχική σελίδα για session cookies
+            await s.get("https://www.doyouspain.com/index.htm", timeout=15)
+
+            # 2. Εκτέλεση Search
+            search_payload = {
+                "lugar_entrega": loc_query,
+                "fecha_recogida": p_str,
+                "hora_recogida": "10:00",
+                "fecha_devolucion": d_str,
+                "hora_devolucion": "10:00",
+                "age": "30"
+            }
             
+            resp = await s.post(
+                "https://www.doyouspain.com/do/search",
+                data=search_payload,
+                allow_redirects=True,
+                timeout=25
+            )
+            
+            html = resp.text
+            soup = BeautifulSoup(html, "html.parser")
+
+            suppliers_list = [
+                "Surprice", "Abbycar", "addCar", "AutoUnion", "Autocar", "Avance", 
+                "Avis", "Beepit", "Caldera", "CarRental2Greece", "Carwiz", "Centauro", 
+                "Cretamotor", "Enterprise", "Europcar", "Exer", "Flex", "Goldcar", 
+                "Green Motion", "Hertz", "Sixt", "OK Mobility", "Budget", "Thrifty"
+            ]
+
+            cards = soup.select(".booking-item, div[class*='deal'], div[class*='result'], tr.car-row")
+            if not cards:
+                cards = [soup]
+
             rank = 1
             seen = set()
-            for card in cards:
-                if rank > 10: break
-                text = await card.inner_text()
-                
-                prices = re.findall(r'(\d+[\.,]\d{2})\s*€', text)
-                if not prices: continue
-                
-                price_main = float(prices[0].replace(",", "."))
-                price_day = float(prices[1].replace(",", ".")) if len(prices) > 1 else round(price_main/days, 2)
-                
-                car_name = "Economy Car"
-                for l in text.split("\n"):
-                    l_clean = l.strip()
-                    if "or similar" in l_clean.lower() or any(b in l_clean.lower() for b in ["fiat", "citroen", "vw", "toyota", "hyundai", "peugeot", "opel", "kia", "suzuki", "nissan", "renault"]):
-                        car_name = l_clean
-                        break
-                        
-                key = f"{car_name}_{price_main}"
-                if key in seen: continue
-                seen.add(key)
-                
-                supplier = "Partner"
-                for s in ["Surprice", "Abbycar", "addCar", "AutoUnion", "Autocar", "Avance", "Avis", "Beepit", "Caldera", "CarRental2Greece", "Carwiz", "Centauro", "Cretamotor", "Enterprise", "Europcar", "Exer", "Flex", "Goldcar", "Green Motion", "Hertz", "Sixt", "OK Mobility"]:
-                    if s.lower() in text.lower():
-                        supplier = s
-                        break
-                        
-                results.append({
-                    "Rank": rank,
-                    "Vehicle": car_name,
-                    "Supplier": supplier,
-                    "Total_EUR": price_main,
-                    "Per_Day_EUR": price_day
-                })
-                rank += 1
 
-        except Exception as e:
-            print(f"Playwright Xvfb Error: {e}")
-        finally:
-            await browser.close()
-            
+            for card in cards:
+                text = card.get_text(separator=" ")
+                euro_matches = re.findall(r'(\d+[\.,]\d{2})\s*€', text)
+                if not euro_matches:
+                    continue
+
+                for p_raw in euro_matches:
+                    p_val = float(p_raw.replace(",", "."))
+                    if p_val < 5.0 or p_val > 1500.0:
+                        continue
+
+                    # Εύρεση οχήματος
+                    car_name = "Economy Car or similar"
+                    for line in text.splitlines():
+                        l = line.strip()
+                        if "or similar" in l.lower() or any(b in l.lower() for b in ["fiat", "citroen", "vw", "toyota", "hyundai", "peugeot", "opel", "suzuki", "nissan", "renault", "skoda"]):
+                            car_name = l
+                            break
+
+                    # Εύρεση προμηθευτή
+                    supplier = "DoYouSpain Partner"
+                    for sup in suppliers_list:
+                        if sup.lower() in text.lower():
+                            supplier = sup
+                            break
+
+                    key = f"{car_name}_{p_val}"
+                    if key in seen:
+                        continue
+                    seen.add(key)
+
+                    results.append({
+                        "Rank": rank,
+                        "Vehicle": car_name,
+                        "Supplier": supplier,
+                        "Total_EUR": p_val,
+                        "Per_Day_EUR": round(p_val / days, 2)
+                    })
+                    rank += 1
+                    if rank > 15:
+                        break
+                if rank > 15:
+                    break
+
+            # Ταξινόμηση βάσει τιμής
+            results.sort(key=lambda x: x["Total_EUR"])
+            for idx, item in enumerate(results, 1):
+                item["Rank"] = idx
+
+    except Exception as e:
+        print(f"Cloud Scrape Error: {e}")
+
     return results
 
 async def main_async():
