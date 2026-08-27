@@ -2,6 +2,7 @@ import os
 import io
 import asyncio
 import re
+import random
 import pandas as pd
 from datetime import datetime, timedelta
 from aiohttp import web
@@ -13,6 +14,7 @@ from telegram.ext import (
     ContextTypes,
 )
 from playwright.async_api import async_playwright
+from playwright_stealth import stealth_async
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
@@ -34,7 +36,7 @@ DURATIONS = {
 
 async def start_dummy_server():
     async def handle_ping(request):
-        return web.Response(text="Carsniper Playwright Live")
+        return web.Response(text="Carsniper Stealth Live")
     server = web.Application()
     server.router.add_get("/", handle_ping)
     runner = web.AppRunner(server)
@@ -90,12 +92,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data == "scrape_now":
-        await query.edit_message_text("⏳ **Ανάκτηση πραγματικών τιμών μέσω browser...** Αυτό μπορεί να διαρκέσει 15-25 δευτερόλεπτα.", parse_mode="Markdown")
+        await query.edit_message_text("⏳ **Ανάκτηση μέσω stealth browser...** \nΠαρακαλώ περιμένετε 20-30 δευτερόλεπτα (παρακάμπτουμε το Cloudflare).", parse_mode="Markdown")
         
         results = await scrape_with_playwright(context.user_data)
 
         if not results:
-            await query.message.reply_text("❌ Το DoYouSpain μπλόκαρε την πρόσβαση ή δεν βρέθηκαν διαθέσιμα αυτοκίνητα. Δοκιμάστε ξανά με /start.")
+            await query.message.reply_text("❌ Το DoYouSpain μπλόκαρε προσωρινά την IP του server. Δοκιμάστε ξανά σε λίγα λεπτά με /start.")
             return
 
         msg_lines = [f"🏆 **Top 10 Αποτελέσματα ({context.user_data['loc_name']}):**\n"]
@@ -160,21 +162,37 @@ async def scrape_with_playwright(user_data):
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
-            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-blink-features=AutomationControlled"]
+            args=[
+                "--no-sandbox", 
+                "--disable-setuid-sandbox", 
+                "--disable-blink-features=AutomationControlled",
+                "--window-size=1920,1080"
+            ]
         )
         context = await browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
             viewport={"width": 1920, "height": 1080},
-            locale="en-GB"
+            locale="en-GB",
+            timezone_id="Europe/Athens"
         )
         page = await context.new_page()
         
+        # Ενεργοποίηση Stealth Mode
+        await stealth_async(page)
+        
         try:
+            # Τυχαία καθυστέρηση πριν την κλήση
+            await asyncio.sleep(random.uniform(1.5, 3.5))
+            
             url = f"https://www.doyouspain.com/do/list/en?loc={loc_slug}&pickup={p_str}&dropoff={d_str}"
-            await page.goto(url, wait_until="domcontentloaded", timeout=50000)
+            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            
+            # Προσομοίωση ανθρώπινου scroll
+            await page.mouse.wheel(0, 500)
+            await asyncio.sleep(random.uniform(2.0, 4.0))
             
             try:
-                await page.wait_for_selector("text=View deal", timeout=30000)
+                await page.wait_for_selector("text=View deal", timeout=35000)
                 await page.wait_for_timeout(3000)
             except Exception:
                 await page.wait_for_timeout(6000)
