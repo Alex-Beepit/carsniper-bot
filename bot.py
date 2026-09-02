@@ -2,6 +2,8 @@ import os
 import io
 import logging
 import asyncio
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 import pandas as pd
 from datetime import datetime
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
@@ -252,7 +254,33 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error("Exception κατά το χειρισμό update:", exc_info=context.error)
 
 
+class _HealthCheckHandler(BaseHTTPRequestHandler):
+    """Ελάχιστος HTTP handler ώστε το Render να ανιχνεύει ανοιχτό port."""
+
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def log_message(self, format, *args):
+        # Αποσιώπηση των logs του HTTP server, ώστε να μη γεμίζουν τα logs του bot
+        pass
+
+
+def _start_health_check_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), _HealthCheckHandler)
+    logger.info(f"Health-check HTTP server ξεκίνησε στο port {port}")
+    server.serve_forever()
+
+
 def main():
+    # Ξεκινάει σε ξεχωριστό daemon thread ώστε να μην μπλοκάρει το polling.
+    # Το Render (Web Service) απαιτεί ανοιχτό port για να θεωρήσει το
+    # deploy "Live" — το telegram polling από μόνο του δεν ανοίγει port.
+    threading.Thread(target=_start_health_check_server, daemon=True).start()
+
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     conv_handler = ConversationHandler(
